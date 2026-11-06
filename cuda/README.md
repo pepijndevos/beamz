@@ -155,6 +155,56 @@ The HIP build passes the same hardware parity suite as CUDA, with an identical s
 of pre-existing failures on both platforms. Run AMD suites only when the card
 does not drive a display: a faulting kernel resets the GPU.
 
+## CPU (OpenMP)
+
+The same sources also build for JAX's CPU client as `beamz._cpu`. A third
+prelude branch, `src/cpu_launch.h`, compiles the kernels as C++ and runs every
+`BEAMZ_LAUNCH` through an OpenMP block scheduler: blocks are spread over
+threads, and the threads of a block run one after another with `x` fastest.
+Warps are one lane wide, `atomicAdd` maps to OpenMP atomics, and `blockIdx`,
+`threadIdx`, `blockDim` and `gridDim` are thread-local.
+
+```console
+cmake -S cuda -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DBEAMZ_GPU_PLATFORM=CPU \
+  -DPython_EXECUTABLE="$(which python)" -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
+cmake --build build-cpu
+cp build-cpu/_cpu*.so beamz/
+```
+
+`BEAMZ_CPU_FLAGS` (default `-O3;-march=native`) sets the optimisation and target
+flags; `-ffp-contract=off` is always added. In a process without GPUs, BeamZ
+loads `beamz._cpu` and registers its targets for XLA's CPU platform.
+`backend="auto"` keeps JAX; request `backend="cuda_streamed"` explicitly.
+
+Kernels that need shared memory or barriers (two-step tiles, the fused CPML
+interior, `cuda_mstep`) cannot run this way. They all request dynamic shared
+memory, which the CPU launcher rejects with `cudaErrorNotSupported`. Scheduling
+never selects them on CPU: two-step requests fall back to single steps, and the
+`cuda_mstep` target is not registered. The CPU build is single-device; the
+sharded target is not registered (see the CPU plan for the multi-device
+investigation).
+
+Two details make the CPU build fast and reproducible. Struct kernel parameters
+use `BEAMZ_ARG(T)` / `BEAMZ_GRID_ARG(T)`, which bind by reference on the CPU
+(GPUs keep by-value parameters); copying the 4 KB launch descriptor once per
+CUDA thread had spent more than half the time in `memcpy`. OpenMP workers also
+adopt the calling XLA thread's flush-to-zero and denormals-are-zero modes, so
+results do not depend on which thread ran a block.
+
+Same realistic workload as above (256 steps, median of 5 warm samples) on a
+Ryzen 9 7950X (16 cores, DDR5), JAX 0.9.0 CPU, GCUPS:
+
+| Shape (z×y×x) | JAX | native CPU build |
+|---|---:|---:|
+| 64×96×128 | 0.14 | 0.31 |
+| 96×160×256 | 0.11 | 0.32 |
+| 128×256×512 | 0.12 | 0.35 |
+
+About 91% of the time is in the kernels themselves; they are scalar per CUDA
+thread and stream the field set several times per step, so a vectorised or
+temporally tiled CPU schedule is the next lever.
+
 ## Streamed and multistep schedules
 
 `backend="cuda"` uses one CUDA component (**0.30.0 / ABI 30**) with two schedules.
